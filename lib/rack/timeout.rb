@@ -26,16 +26,19 @@ module Rack
     # helper methods to setup getter/setters for timeout properties. Ensure they're always positive numbers or false. When set to false (or 0), their behaviour is disabled.
     class << self
       def set_timeout_property(property_name, value)
-        unless value == false || (value.is_a?(Numeric) && value >= 0)
+        unless value.is_a?(Proc) || value == false || (value.is_a?(Numeric) && value >= 0)
           raise ArgumentError, "value for #{property_name} should be false, zero, or a positive number."
         end
-        value = false if value.zero? # zero means we're disabling the feature
+        value = false if value.is_a?(Numeric) && value.zero? # zero means we're disabling the feature
         instance_variable_set("@#{property_name}", value)
       end
 
       def timeout_property(property_name, start_value)
         singleton_class.instance_eval do
-          attr_reader property_name
+          define_method(property_name) do |env|
+            v = instance_variable_get("@#{property_name}")
+            v.is_a?(Proc) ? v.(env) : v
+          end
           define_method("#{property_name}=") { |v| set_timeout_property(property_name, v) }
         end
         set_timeout_property(property_name, start_value)
@@ -64,14 +67,14 @@ module Rack
 
       time_started_service = Time.now                      # The time the request started being processed by rack
       time_started_wait    = RT._read_x_request_start(env) # The time the request was initially receibed by the web server (if available)
-      effective_overtime   = (RT.wait_overtime && RT._request_has_body?(env)) ? RT.wait_overtime : 0 # additional wait timeout (if set and applicable)
+      effective_overtime   = (RT.wait_overtime(env) && RT._request_has_body?(env)) ? RT.wait_overtime(env) : 0 # additional wait timeout (if set and applicable)
       seconds_service_left = nil
 
       # if X-Request-Start is present and wait_timeout is set, expire requests older than wait_timeout (+wait_overtime when applicable)
-      if time_started_wait && RT.wait_timeout
+      if time_started_wait && RT.wait_timeout(env)
         seconds_waited          = time_started_service - time_started_wait # how long it took between the web server first receiving the request and rack being able to handle it
         seconds_waited          = 0 if seconds_waited < 0                  # make up for potential time drift between the routing server and the application server
-        final_wait_timeout      = RT.wait_timeout + effective_overtime     # how long the request will be allowed to have waited
+        final_wait_timeout      = RT.wait_timeout(env) + effective_overtime     # how long the request will be allowed to have waited
         seconds_service_left    = final_wait_timeout - seconds_waited      # first calculation of service timeout (relevant if request doesn't get expired, may be overriden later)
         info.wait, info.timeout = seconds_waited, final_wait_timeout       # updating the info properties; info.timeout will be the wait timeout at this point
         if seconds_service_left <= 0 # expire requests that have waited for too long in the queue (as they are assumed to have been dropped by the web server / routing layer at this point)
@@ -81,11 +84,11 @@ module Rack
       end
 
       # pass request through if service_timeout is false (i.e., don't time it out at all.)
-      return @app.call(env) unless RT.service_timeout
+      return @app.call(env) unless RT.service_timeout(env)
 
       # compute actual timeout to be used for this request; if service_past_wait is true, this is just service_timeout. If false (the default), and wait time was determined, we'll use the shortest value between seconds_service_left and service_timeout. See comment above at service_past_wait for justification.
-      info.timeout = RT.service_timeout # nice and simple, when service_past_wait is true, not so much otherwise:
-      info.timeout = seconds_service_left if !RT.service_past_wait && seconds_service_left && seconds_service_left > 0 && seconds_service_left < RT.service_timeout
+      info.timeout = RT.service_timeout(env) # nice and simple, when service_past_wait is true, not so much otherwise:
+      info.timeout = seconds_service_left if !RT.service_past_wait && seconds_service_left && seconds_service_left > 0 && seconds_service_left < RT.service_timeout(env)
 
       RT._set_state! env, :ready
       begin
